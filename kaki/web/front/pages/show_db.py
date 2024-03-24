@@ -1,54 +1,77 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import datetime 
-from datetime import date
-# Import the GNN-based function for finding similar crypto pairs
+import networkx as nx
+from node2vec import Node2Vec
+from kaki.kkdatac.crypto import get_price, get_pairs
+import matplotlib.pyplot as plt
 from kaki.ai.ml.mod_gnn import find_similar_crypto_pairs
 
-# Configuration to avoid deprecation warnings
+# Set Streamlit configuration
 st.set_option('deprecation.showPyplotGlobalUse', False)
 
-# Initialize session state variables if they don't exist
-if "crypto_pair" not in st.session_state:
-    st.session_state.crypto_pair = "BTC-USDT"
-if "days" not in st.session_state:
-    st.session_state.days = 60
-if "similar_pairs" not in st.session_state:
-    st.session_state.similar_pairs = None
+# Initialize session state variables
+for key in ['crypto_pair', 'analysis_result', 'graph']:
+    if key not in st.session_state:
+        st.session_state[key] = None
 
-# Sidebar for user inputs
+# Load cryptocurrency data
+@st.cache
+def load_data():
+    pairs = get_pairs("kline-1D")
+    data = get_price(instId=pairs, bar="1D", fields=["open", "high", "low", "close", "instId"])
+    data.set_index(["instId", "timestamp"], inplace=True)
+    return data
+
+data = load_data()
+
+# Sidebar: User Inputs
 with st.sidebar:
-    st.title("GNN Crypto Analyzer")
-    st.session_state.crypto_pair = st.text_input("Enter Crypto Pair", value="BTC-USDT")
-    st.session_state.days = st.number_input("Days", min_value=10, max_value=180, value=60)
-    analyze_button = st.button("Analyze")
+    st.title("GNN Cryptocurrency Analysis")
+    st.session_state.crypto_pair = st.selectbox("Select Cryptocurrency Pair", get_pairs("kline-1D"))
+    if st.button("Load & Analyze"):
+        st.session_state.analysis_result = None  # Reset analysis result
 
-# Main page
-st.title("Find Similar Cryptocurrency Pairs using GNN")
-st.write("This tool uses Graph Neural Networks (GNN) to analyze and find cryptocurrency pairs similar to your selected pair based on historical trading data.")
+# Main Content
+st.title("Cryptocurrency Analysis with GNN")
 
-# Function to load data and find similar pairs
-def analyze_similar_pairs():
-    try:
-        # Use the imported function to find similar crypto pairs
-        similar_pairs_df = find_similar_crypto_pairs(st.session_state.crypto_pair, st.session_state.days)
-        st.session_state.similar_pairs = similar_pairs_df
-        st.success("Analysis complete!")
-    except Exception as e:
-        st.error(f"An error occurred: {e}")
+# Function to preprocess data and perform GNN analysis
+def analyze_data(data, crypto_pair):
+    data['timestamp'] = pd.to_datetime(data.index.get_level_values('timestamp'))
+    data = data.groupby('instId').filter(lambda x: len(x) >= 60)
+    data.sort_values(by=['instId', 'timestamp'], inplace=True)
+    last_60_days_data = data.groupby('instId').tail(60)
 
-# Trigger analysis on button click
-if analyze_button:
-    analyze_similar_pairs()
+    percent_change = last_60_days_data.groupby('instId')['close'].pct_change()
+    last_60_days_data['Daily Return'] = percent_change
+    last_60_days_data.dropna(inplace=True)
 
-# Display results
-if st.session_state.similar_pairs is not None:
-    st.write("## Similar Cryptocurrency Pairs")
-    st.dataframe(st.session_state.similar_pairs)
+    corr_df = last_60_days_data.pivot_table(values='Daily Return', index='timestamp', columns='instId').corr()
+    corr_df[corr_df < 0.7] = 0
+    np.fill_diagonal(corr_df.values, 0)
 
-st.write("### How it Works")
-st.write("1. Enter the cryptocurrency pair you're interested in (e.g., BTC-USDT).")
-st.write("2. Specify the number of days for the analysis period.")
-st.write("3. Click the 'Analyze' button to find similar cryptocurrency pairs based on GNN analysis.")
-st.write("The analysis leverages historical trading data to identify patterns and relationships between different cryptocurrency pairs using Graph Neural Networks.")
+    graph = nx.Graph(corr_df)
+    node2vec = Node2Vec(graph, dimensions=32, p=1, q=3, walk_length=10, num_walks=600, workers=4)
+    model = node2vec.fit(window=3, min_count=1, batch_words=4)
+
+    similar_pairs = model.wv.most_similar(crypto_pair, topn=5)
+    result = pd.DataFrame(similar_pairs, columns=['Ticker', 'Similarity'])
+    result['Similarity'] = result['Similarity'].apply(lambda x: round(x * 100, 2))
+
+    return result, graph
+
+# Perform analysis and display results
+if st.session_state.crypto_pair and not st.session_state.analysis_result:
+    with st.spinner('Analyzing...'):
+        st.session_state.analysis_result, st.session_state.graph = analyze_data(data, st.session_state.crypto_pair)
+        st.success('Analysis completed!')
+
+if st.session_state.analysis_result is not None:
+    st.write(f"Similar Cryptocurrencies to {st.session_state.crypto_pair}:")
+    st.table(st.session_state.analysis_result)
+
+# Optional: Visualize the correlation graph
+if st.session_state.graph is not None and st.checkbox("Show Correlation Graph"):
+    fig, ax = plt.subplots(figsize=(8, 6))
+    nx.draw(st.session_state.graph, ax=ax, with_labels=True, node_size=50, font_size=8)
+    st.pyplot(fig)
